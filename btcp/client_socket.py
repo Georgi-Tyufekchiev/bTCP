@@ -1,7 +1,9 @@
+from time import sleep
+
 from btcp.btcp_socket import BTCPSocket, BTCPStates
 from btcp.lossy_layer import LossyLayer
 from btcp.constants import *
-
+from random import getrandbits
 import queue
 
 
@@ -29,7 +31,6 @@ class BTCPClientSocket(BTCPSocket):
     you probably want to use Queues, or a similar thread safe collection.
     """
 
-
     def __init__(self, window, timeout):
         """Constructor for the bTCP client socket. Allocates local resources
         and starts an instance of the Lossy Layer.
@@ -39,11 +40,13 @@ class BTCPClientSocket(BTCPSocket):
         """
         super().__init__(window, timeout)
         self._lossy_layer = LossyLayer(self, CLIENT_IP, CLIENT_PORT, SERVER_IP, SERVER_PORT)
-
+        self._flag = False
+        self._state = None
+        self._SEQ = None
+        self._ACK = None
         # The data buffer used by send() to send data from the application
         # thread into the network thread. Bounded in size.
         self._sendbuf = queue.Queue(maxsize=1000)
-
 
     ###########################################################################
     ### The following section is the interface between the transport layer  ###
@@ -71,9 +74,25 @@ class BTCPClientSocket(BTCPSocket):
 
         Remember, we expect you to implement this *as a state machine!*
         """
-        pass # present to be able to remove the NotImplementedError without having to implement anything yet.
-        raise NotImplementedError("No implementation of lossy_layer_segment_received present. Read the comments & code of client_socket.py.")
+        seq, ack, flags, window, datalen, checksum = self.unpack_segment_header(segment[:10])
+        if self._state == BTCPStates.SYN_SENT:
+            if flags == 6:  # SYN&ACK rcv
+                self._flag = False
+                self._SEQ = seq
+                self._ACK = ack
+        if self._state == BTCPStates.FIN_SENT:
+            if flags == 3:  # FIN&ACK rcv
+                self._flag = False
+                self._SEQ = seq
+                self._ACK = ack
 
+        try:
+            pass
+        except queue.Full:
+            # Data gets silently dropped if the receive buffer is full. You
+            # need to ensure this doesn't happen by using window sizes and not
+            # acknowledging dropped data.
+            pass
 
     def lossy_layer_tick(self):
         """Called by the lossy layer whenever no segment has arrived for
@@ -100,8 +119,6 @@ class BTCPClientSocket(BTCPSocket):
         lossy_layer_segment_received or lossy_layer_tick.
         """
 
-        raise NotImplementedError("Only rudimentary implementation of lossy_layer_tick present. Read the comments & code of client_socket.py, then remove the NotImplementedError.")
-
         # Send all data available for sending.
         # Relies on an eventual exception to break from the loop when no data
         # is available.
@@ -119,7 +136,6 @@ class BTCPClientSocket(BTCPSocket):
             except queue.Empty:
                 # No data was available for sending.
                 break
-
 
     ###########################################################################
     ### You're also building the socket API for the applications to use.    ###
@@ -145,7 +161,6 @@ class BTCPClientSocket(BTCPSocket):
     ### of acknowledgements and synchronization. You should implement that  ###
     ### above.                                                              ###
     ###########################################################################
-
     def connect(self):
         """Perform the bTCP three-way handshake to establish a connection.
 
@@ -161,9 +176,25 @@ class BTCPClientSocket(BTCPSocket):
         boolean or enum has the expected value. We do not think you will need
         more advanced thread synchronization in this project.
         """
-        pass # present to be able to remove the NotImplementedError without having to implement anything yet.
-        raise NotImplementedError("No implementation of connect present. Read the comments & code of client_socket.py.")
+        self._SEQ = getrandbits(16)
+        syn_segment = self.build_segment_header(self._SEQ, 0, syn_set=True)
+        self._lossy_layer.send_segment(syn_segment)
+        print("SYN SEGMENT: ",self._SEQ,self._ACK)
+        print("CLIENT SEND SYN")
+        self._state = BTCPStates.SYN_SENT
+        self._flag = True
+        while self._flag:
+            sleep(0.1)  # 100ms
+            continue
+        ack_segment = BTCPSocket.build_segment_header(self._ACK, self._SEQ, ack_set=True)
+        self._lossy_layer.send_segment(ack_segment)
+        print("ACK SEGMENT: ",self._SEQ,self._ACK)
+        print("CLIENT SEND ACK")
+        self._state = BTCPStates.ESTABLISHED
+        print("CONN EST")
+        print("EST SEGMENT: ",self._SEQ,self._ACK)
 
+        return
 
     def send(self, data):
         """Send data originating from the application in a reliable way to the
@@ -193,8 +224,6 @@ class BTCPClientSocket(BTCPSocket):
         done later.
         """
 
-        raise NotImplementedError("Only rudimentary implementation of send present. Read the comments & code of client_socket.py, then remove the NotImplementedError.")
-
         # Example with a finite buffer: a queue with at most 1000 chunks,
         # for a maximum of 985KiB data buffered to get turned into packets.
         # See BTCPSocket__init__() in btcp_socket.py for its construction.
@@ -203,14 +232,13 @@ class BTCPClientSocket(BTCPSocket):
         while sent_bytes < datalen:
             # Loop over data using sent_bytes. Reassignments to data are too
             # expensive when data is large.
-            chunk = data[sent_bytes:sent_bytes+PAYLOAD_SIZE]
+            chunk = data[sent_bytes:sent_bytes + PAYLOAD_SIZE]
             try:
                 self._sendbuf.put_nowait(chunk)
                 sent_bytes += len(chunk)
             except queue.Full:
                 break
         return sent_bytes
-
 
     def shutdown(self):
         """Perform the bTCP three-way finish to shutdown the connection.
@@ -227,9 +255,20 @@ class BTCPClientSocket(BTCPSocket):
         boolean or enum has the expected value. We do not think you will need
         more advanced thread synchronization in this project.
         """
-        pass # present to be able to remove the NotImplementedError without having to implement anything yet.
-        raise NotImplementedError("No implementation of shutdown present. Read the comments & code of client_socket.py.")
-
+        fin_segment = self.build_segment_header(self._SEQ, self._ACK, fin_set=True)
+        self._lossy_layer.send_segment(fin_segment)
+        print("FIN SENT")
+        self._state = BTCPStates.FIN_SENT
+        self._flag = True
+        while self._flag:
+            sleep(0.1)  # 100ms
+            continue
+        ack_segment = BTCPSocket.build_segment_header(self._ACK, self._SEQ, ack_set=True)
+        print("ACK SENT")
+        self._lossy_layer.send_segment(ack_segment)
+        self._state = BTCPStates.CLOSED
+        print("CLOSED")
+        return
 
     def close(self):
         """Cleans up any internal state by at least destroying the instance of
@@ -248,11 +287,11 @@ class BTCPClientSocket(BTCPSocket):
                 2. if so, destroy the resource.
             3. set the reference to None.
         """
-        if self._lossy_layer is not None:
-            self._lossy_layer.destroy()
+        
+        if self._lossy_layer is not None:          
+            self._lossy_layer.destroy()            
         self._lossy_layer = None
 
-
     def __del__(self):
-        """Destructor. Do not modify."""
+        """Destructor. Do not modify."""        
         self.close()

@@ -64,6 +64,9 @@ def btcp_file_transfer_client():
     # implementation relies on you starting the server before the client,
     # and just dumps the entire file into the network immediately.
     s.connect()
+    s.shutdown()
+    s.close()
+    return
 
     # Actually open the file, read the file, and send the data.
     with open(args.input, 'rb') as infile:

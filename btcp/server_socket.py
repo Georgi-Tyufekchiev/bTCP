@@ -1,9 +1,8 @@
 from btcp.btcp_socket import BTCPSocket, BTCPStates
 from btcp.lossy_layer import LossyLayer
 from btcp.constants import *
-
+from random import getrandbits
 import queue
-import struct
 
 
 class BTCPServerSocket(BTCPSocket):
@@ -34,7 +33,6 @@ class BTCPServerSocket(BTCPSocket):
     you probably want to use Queues, or a similar thread safe collection.
     """
 
-
     def __init__(self, window, timeout):
         """Constructor for the bTCP server socket. Allocates local resources
         and starts an instance of the Lossy Layer.
@@ -44,7 +42,10 @@ class BTCPServerSocket(BTCPSocket):
         """
         super().__init__(window, timeout)
         self._lossy_layer = LossyLayer(self, SERVER_IP, SERVER_PORT, CLIENT_IP, CLIENT_PORT)
-
+        self._flag = False
+        self._state = None
+        self._SEQ = None
+        self._ACK = None
         # The data buffer used by lossy_layer_segment_received to move data
         # from the network thread into the application thread. Bounded in size.
         # If data overflows the buffer it will get lost -- that's what window
@@ -52,7 +53,6 @@ class BTCPServerSocket(BTCPSocket):
         # For this rudimentary implementation, we simply hope receive manages
         # to be faster than send.
         self._recvbuf = queue.Queue(maxsize=1000)
-
 
     ###########################################################################
     ### The following section is the interface between the transport layer  ###
@@ -87,23 +87,43 @@ class BTCPServerSocket(BTCPSocket):
         Remember, we expect you to implement this *as a state machine!*
         """
 
-        raise NotImplementedError("Only rudimentary implementation of lossy_layer_segment_received present. Read the comments & code of server_socket.py, then remove the NotImplementedError.")
-
-        # Get length from header. Change this to a proper segment header unpack
-        # after implementing BTCPSocket.unpack_segment_header in btcp_socket.py
-        datalen, = struct.unpack("!H", segment[6:8])
-        # Slice data from incoming segment.
-        chunk = segment[HEADER_SIZE:HEADER_SIZE + datalen]
-        # Pass data into receive buffer so that the application thread can
+        seq, ack, flags, window, datalen, checksum = self.unpack_segment_header(segment[:10])
+        if self._state == BTCPStates.ACCEPTING:
+            if flags == 4:  # SYN rcv
+                self._state = BTCPStates.SYN_RCVD
+                self._ACK = seq
+                return
+        if self._state == BTCPStates.SYN_SENT:
+            if flags == 2:  # ACK rcv
+                self._ACK = ack
+                self._SEQ = seq
+                self._state = BTCPStates.ESTABLISHED
+                return
+        if flags == 1:  # FIN rcv
+            self._state = BTCPStates.CLOSING
+            print("FIN RCV")
+            self.closing()
+            return
+        if self._state == BTCPStates.CLOSING:
+            if flags == 2:  # ACK rcv            	 
+                self._state = BTCPStates.CLOSED
+                print("ACK RCV")
+                return
+                # Pass data into receive buffer so that the application thread can
         # retrieve it.
         try:
-            self._recvbuf.put_nowait(chunk)
+            pass
         except queue.Full:
             # Data gets silently dropped if the receive buffer is full. You
             # need to ensure this doesn't happen by using window sizes and not
             # acknowledging dropped data.
             pass
 
+    def closing(self):
+        fin_segment = self.build_segment_header(self._SEQ, self._ACK, fin_set=True, ack_set=True)
+        self._lossy_layer.send_segment(fin_segment)
+        print("FIN ACK SENT")
+        return
 
     def lossy_layer_tick(self):
         """Called by the lossy layer whenever no segment has arrived for
@@ -126,10 +146,8 @@ class BTCPServerSocket(BTCPSocket):
         candidate to put in a helper method which can be called from either
         lossy_layer_segment_received or lossy_layer_tick.
         """
-        pass # present to be able to remove the NotImplementedError without having to implement anything yet.
-        raise NotImplementedError("No implementation of lossy_layer_tick present. Read the comments & code of server_socket.py.")
-
-
+        pass  # present to be able to remove the NotImplementedError without having to implement anything yet.
+      
     ###########################################################################
     ### You're also building the socket API for the applications to use.    ###
     ### The following section is the interface between the application      ###
@@ -176,9 +194,32 @@ class BTCPServerSocket(BTCPSocket):
         boolean or enum has the expected value. We do not think you will need
         more advanced thread synchronization in this project.
         """
-        pass # present to be able to remove the NotImplementedError without having to implement anything yet.
-        raise NotImplementedError("No implementation of accept present. Read the comments & code of server_socket.py.")
+        self._state = BTCPStates.ACCEPTING
+        print("SERVER ACCEPTING")
+        while self._state:
+            
+            if self._state == BTCPStates.SYN_RCVD:
+                print("SERVER SYN RCV")
+                print("SYN SEGMENT: ", self._SEQ, self._ACK)
 
+                break
+            continue
+        self._SEQ = getrandbits(16)
+        syn_ack = self.build_segment_header(self._SEQ, self._ACK, syn_set=True, ack_set=True,
+                                            )
+        self._lossy_layer.send_segment(syn_ack)
+        print("SYN ACK SEGMENT: ",self._SEQ,self._ACK)
+
+        print("SERVER SEND ACK")
+
+        self._state = BTCPStates.SYN_SENT
+        while self._state:
+            if self._state == BTCPStates.ESTABLISHED:
+                print("SERVER EST")
+                print("EST SEGMENT: ", self._SEQ, self._ACK)
+
+                break
+            continue
 
     def recv(self):
         """Return data that was received from the client to the application in
@@ -212,7 +253,6 @@ class BTCPServerSocket(BTCPSocket):
         Again, you should feel free to deviate from how this usually works.
         """
 
-        raise NotImplementedError("Only rudimentary implementation of recv present. Read the comments & code of server_socket.py, then remove the NotImplementedError.")
 
         # Rudimentary example implementation:
         # Empty the queue in a loop, reading into a larger bytearray object.
@@ -233,9 +273,8 @@ class BTCPServerSocket(BTCPSocket):
                 # segments so that will *not* signal disconnect.
                 data.extend(self._recvbuf.get_nowait())
         except queue.Empty:
-            pass # (Not break: the exception itself has exited the loop)
+            pass  # (Not break: the exception itself has exited the loop)
         return bytes(data)
-
 
     def close(self):
         """Cleans up any internal state by at least destroying the instance of
@@ -257,7 +296,6 @@ class BTCPServerSocket(BTCPSocket):
         if self._lossy_layer is not None:
             self._lossy_layer.destroy()
         self._lossy_layer = None
-
 
     def __del__(self):
         """Destructor. Do not modify."""

@@ -13,25 +13,24 @@ class BTCPStates(Enum):
     Don't use the integer values of this enum directly. Always refer to them as
     BTCPStates.CLOSED etc.
     """
-    CLOSED    = 0
+    CLOSED = 0
     ACCEPTING = 1
-    SYN_SENT  = 2
-    SYN_RCVD  = 3
-    _         = 4 # There's an obvious state that goes here. Give it a name.
-    FIN_SENT  = 5
-    CLOSING   = 6
-    __        = 7 # If you need more states, extend the Enum like this.
-    raise NotImplementedError("Check btcp_socket.py's BTCPStates enum. We left out some states you will need.")
+    SYN_SENT = 2
+    SYN_RCVD = 3
+    ESTABLISHED = 4
+    FIN_SENT = 5
+    CLOSING = 6
+    __ = 7  # If you need more states, extend the Enum like this.
 
 
 class BTCPSocket:
     """Base class for bTCP client and server sockets. Contains static helper
     methods that will definitely be useful for both sending and receiving side.
     """
+
     def __init__(self, window, timeout):
         self._window = window
         self._timeout = timeout
-
 
     @staticmethod
     def in_cksum(segment):
@@ -44,9 +43,19 @@ class BTCPSocket:
         segment, the checksum field in the header should be set to 0x0000, and
         then the resulting checksum should be put in its place.
         """
-        pass # present to be able to remove the NotImplementedError without having to implement anything yet.
-        raise NotImplementedError("No implementation of in_cksum present. Read the comments & code of btcp_socket.py.")
-
+        header = BTCPSocket.unpack_segment_header(segment[:10])
+        sum = 0
+        for value in header:
+            sum += value
+        hex_sum = hex(sum)
+        if len(hex_sum[2:]) == 3:
+            carry = hex_sum[2]
+            hex_sum = hex_sum[2:].replace(carry, '', 1)
+            hex_sum = hex(int(hex_sum, 16) + int(carry, 16))
+        if int(hex_sum, 16) != 255:
+            hex_sum = hex(int(hex_sum, 16) ^ 0xFF)
+        checksum = int(hex_sum, 16)
+        return checksum
 
     @staticmethod
     def build_segment_header(seqnum, acknum,
@@ -76,7 +85,6 @@ class BTCPSocket:
         return struct.pack("!HHBBHH",
                            seqnum, acknum, flag_byte, window, length, checksum)
 
-
     @staticmethod
     def unpack_segment_header(header):
         """Unpack the individual bTCP header field values from the header.
@@ -85,5 +93,5 @@ class BTCPSocket:
         tupling, so it's easy to simply return all of them in one go rather
         than make a separate method for every individual field.
         """
-        pass
-        raise NotImplementedError("No implementation of unpack_segment_header present. Read the comments & code of btcp_socket.py. You should really implement the packing / unpacking of the header into field values before doing anything else!")
+        seqnum, ack, flags, window, datalen, checksum = struct.unpack("!HHBBHH", header)
+        return seqnum, ack, flags, window, datalen, checksum

@@ -4,7 +4,6 @@ Students should NOT need to modify any code in this file!
 However, do read the docstrings to understand what's going on.
 """
 
-
 import socket
 import select
 import sys
@@ -55,6 +54,7 @@ class LossyLayer:
 
     Students should NOT need to modify any code in this class.
     """
+
     def __init__(self, btcp_socket, local_ip, local_port, remote_ip, remote_port):
         self._bTCP_socket = btcp_socket
         self._remote_ip = remote_ip
@@ -74,10 +74,8 @@ class LossyLayer:
                                         args=(self._bTCP_socket, self._event, self._udp_socket))
         self._thread.start()
 
-
     def __del__(self):
         self.destroy()
-
 
     def destroy(self):
         """Flag the thread that it can stop, wait for it to do so, then close
@@ -93,7 +91,6 @@ class LossyLayer:
         self._event = None
         self._thread = None
         self._udp_socket = None
-
 
     def send_segment(self, segment):
         """Put the segment into the network
