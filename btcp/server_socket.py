@@ -2,6 +2,7 @@ from btcp.btcp_socket import BTCPSocket, BTCPStates
 from btcp.lossy_layer import LossyLayer
 from btcp.constants import *
 from random import getrandbits
+from time import sleep
 import queue
 
 
@@ -91,14 +92,32 @@ class BTCPServerSocket(BTCPSocket):
         if self._state == BTCPStates.ACCEPTING:
             if flags == 4:  # SYN rcv
                 self._state = BTCPStates.SYN_RCVD
-                self._ACK = seq
+                self._ACK = seq + 1
                 return
         if self._state == BTCPStates.SYN_SENT:
             if flags == 2:  # ACK rcv
-                self._ACK = ack
-                self._SEQ = seq
+                self._ACK = seq + 1
+                self._SEQ = ack
                 self._state = BTCPStates.ESTABLISHED
                 return
+
+
+        if self._state == BTCPStates.ESTABLISHED and not flags == 1:     #received segment not indicating end of termination aka normal data
+            if seq == self._ACK:                                         #sequence number segment is the expected sequence number meaning no loss of packet
+                try:
+                    self._recvbuf.put_nowait(segment[10:(10 + datalen)])
+                except queue.Full:
+                    self._ACK -= 1                                       #decrease ack by one to not acknowledge dropped data   
+                self._ACK += 1
+                segment = self.build_segment_header(self._SEQ, self._ACK, ack_set=True) + 1008*b'\x00'
+                self._lossy_layer.send_segment(segment)
+                self.recv()
+            else:                                                        #not expected segment, drop it and send same old ack again.
+                segment = self.build_segment_header(self._SEQ, self._ACK, ack_set=True) + 1008*b'\x00'
+                self._lossy_layer.send_segment(segment)
+                self.recv()
+
+
         if flags == 1:  # FIN rcv
             self._state = BTCPStates.CLOSING
             print("FIN RCV")
@@ -109,16 +128,7 @@ class BTCPServerSocket(BTCPSocket):
                 self._state = BTCPStates.CLOSED
                 print("ACK RCV")
                 return
-                # Pass data into receive buffer so that the application thread can
-        # retrieve it.
-        try:
-            pass
-        except queue.Full:
-            # Data gets silently dropped if the receive buffer is full. You
-            # need to ensure this doesn't happen by using window sizes and not
-            # acknowledging dropped data.
-            pass
-
+    
     def closing(self):
         fin_segment = self.build_segment_header(self._SEQ, self._ACK, fin_set=True, ack_set=True)
         self._lossy_layer.send_segment(fin_segment)
@@ -208,18 +218,22 @@ class BTCPServerSocket(BTCPSocket):
         syn_ack = self.build_segment_header(self._SEQ, self._ACK, syn_set=True, ack_set=True,
                                             )
         self._lossy_layer.send_segment(syn_ack)
+        self._state = BTCPStates.SYN_SENT
         print("SYN ACK SEGMENT: ",self._SEQ,self._ACK)
 
         print("SERVER SEND ACK")
 
-        self._state = BTCPStates.SYN_SENT
-        while self._state:
+        
+        """while self._state:
+            print(self._state)
             if self._state == BTCPStates.ESTABLISHED:
                 print("SERVER EST")
                 print("EST SEGMENT: ", self._SEQ, self._ACK)
 
                 break
+            sleep(0.1)            
             continue
+        """
 
     def recv(self):
         """Return data that was received from the client to the application in

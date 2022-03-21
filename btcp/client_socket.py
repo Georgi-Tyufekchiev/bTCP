@@ -48,6 +48,10 @@ class BTCPClientSocket(BTCPSocket):
         # thread into the network thread. Bounded in size.
         self._sendbuf = queue.Queue(maxsize=1000)
 
+        self._window_size = 100
+        self._window_start = None
+        self._window_end = None
+
     ###########################################################################
     ### The following section is the interface between the transport layer  ###
     ### and the lossy (network) layer. When a segment arrives, the lossy    ###
@@ -78,14 +82,23 @@ class BTCPClientSocket(BTCPSocket):
         if self._state == BTCPStates.SYN_SENT:
             if flags == 6:  # SYN&ACK rcv
                 self._flag = False
-                self._SEQ = seq
-                self._ACK = ack
+                self._SEQ = ack
+                self._ACK = seq + 1
+
+                self._window_start = ack
         if self._state == BTCPStates.FIN_SENT:
             if flags == 3:  # FIN&ACK rcv
                 self._flag = False
                 self._SEQ = seq
                 self._ACK = ack
 
+        if self._state == BTCPStates.ESTABLISHED:
+            pass
+            #acknowledge that every sequence number <= to ack - 1 has been received.
+            #move window
+            #resend where necessary
+        
+        
         try:
             pass
         except queue.Full:
@@ -177,8 +190,13 @@ class BTCPClientSocket(BTCPSocket):
         more advanced thread synchronization in this project.
         """
         self._SEQ = getrandbits(16)
+
+        self._window_start = self._SEQ
+        self._window_end = self._window_start + self._window_size -1 #both end and start of window inclusive
+
         syn_segment = self.build_segment_header(self._SEQ, 0, syn_set=True)
         self._lossy_layer.send_segment(syn_segment)
+
         print("SYN SEGMENT: ",self._SEQ,self._ACK)
         print("CLIENT SEND SYN")
         self._state = BTCPStates.SYN_SENT
