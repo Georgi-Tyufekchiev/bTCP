@@ -2,7 +2,6 @@ from btcp.btcp_socket import BTCPSocket, BTCPStates
 from btcp.lossy_layer import LossyLayer
 from btcp.constants import *
 from random import getrandbits
-from time import sleep
 import queue
 
 
@@ -55,24 +54,6 @@ class BTCPServerSocket(BTCPSocket):
         # to be faster than send.
         self._recvbuf = queue.Queue(maxsize=1000)
 
-    ###########################################################################
-    ### The following section is the interface between the transport layer  ###
-    ### and the lossy (network) layer. When a segment arrives, the lossy    ###
-    ### layer will call the lossy_layer_segment_received method "from the   ###
-    ### network thread". In that method you should handle the checking of   ###
-    ### the segment, and take other actions that should be taken upon its   ###
-    ### arrival, like acknowledging the segment and making the data         ###
-    ### available for the application thread that calls to recv can return  ###
-    ### the data.                                                           ###
-    ###                                                                     ###
-    ### Of course you can implement this using any helper methods you want  ###
-    ### to add.                                                             ###
-    ###                                                                     ###
-    ### Since the implementation is inherently multi-threaded, you should   ###
-    ### use a Queue, not a List, to transfer the data to the application    ###
-    ### layer thread: Queues are inherently threadsafe, Lists are not.      ###
-    ###########################################################################
-
     def lossy_layer_segment_received(self, segment):
         """Called by the lossy layer whenever a segment arrives.
 
@@ -92,32 +73,14 @@ class BTCPServerSocket(BTCPSocket):
         if self._state == BTCPStates.ACCEPTING:
             if flags == 4:  # SYN rcv
                 self._state = BTCPStates.SYN_RCVD
-                self._ACK = seq + 1
+                self._ACK = seq
                 return
         if self._state == BTCPStates.SYN_SENT:
             if flags == 2:  # ACK rcv
-                self._ACK = seq + 1
-                self._SEQ = ack
+                self._ACK = ack
+                self._SEQ = seq + 1
                 self._state = BTCPStates.ESTABLISHED
                 return
-
-
-        if self._state == BTCPStates.ESTABLISHED and not flags == 1:     #received segment not indicating end of termination aka normal data
-            if seq == self._ACK:                                         #sequence number segment is the expected sequence number meaning no loss of packet
-                try:
-                    self._recvbuf.put_nowait(segment[10:(10 + datalen)])
-                except queue.Full:
-                    self._ACK -= 1                                       #decrease ack by one to not acknowledge dropped data   
-                self._ACK += 1
-                segment = self.build_segment_header(self._SEQ, self._ACK, ack_set=True) + 1008*b'\x00'
-                self._lossy_layer.send_segment(segment)
-                self.recv()
-            else:                                                        #not expected segment, drop it and send same old ack again.
-                segment = self.build_segment_header(self._SEQ, self._ACK, ack_set=True) + 1008*b'\x00'
-                self._lossy_layer.send_segment(segment)
-                self.recv()
-
-
         if flags == 1:  # FIN rcv
             self._state = BTCPStates.CLOSING
             print("FIN RCV")
@@ -128,7 +91,18 @@ class BTCPServerSocket(BTCPSocket):
                 self._state = BTCPStates.CLOSED
                 print("ACK RCV")
                 return
-    
+                # Pass data into receive buffer so that the application thread can
+        # retrieve it.
+
+
+        try:
+            pass
+        except queue.Full:
+            # Data gets silently dropped if the receive buffer is full. You
+            # need to ensure this doesn't happen by using window sizes and not
+            # acknowledging dropped data.
+            pass
+
     def closing(self):
         fin_segment = self.build_segment_header(self._SEQ, self._ACK, fin_set=True, ack_set=True)
         self._lossy_layer.send_segment(fin_segment)
@@ -157,35 +131,6 @@ class BTCPServerSocket(BTCPSocket):
         lossy_layer_segment_received or lossy_layer_tick.
         """
         pass  # present to be able to remove the NotImplementedError without having to implement anything yet.
-      
-    ###########################################################################
-    ### You're also building the socket API for the applications to use.    ###
-    ### The following section is the interface between the application      ###
-    ### layer and the transport layer. Applications call these methods to   ###
-    ### accept connections, receive data, etc. Conceptually, this happens   ###
-    ### in "the application thread".                                        ###
-    ###                                                                     ###
-    ### You *can*, from this application thread, send segments into the     ###
-    ### lossy layer, i.e. you can call LossyLayer.send_segment(segment)     ###
-    ### from these methods without ensuring that happens in the network     ###
-    ### thread. However, if you do want to do this from the network thread, ###
-    ### you should use the lossy_layer_tick() method above to ensure that   ###
-    ### segments can be sent out even if no segments arrive to trigger the  ###
-    ### call to lossy_layer_segment_received. When passing segments between ###
-    ### the application thread and the network thread, remember to use a    ###
-    ### Queue for its inherent thread safety. Whether you need to send      ###
-    ### segments from the application thread into the lossy layer is up to  ###
-    ### you; you may find you can handle all receiving *and* sending of     ###
-    ### segments in the lossy_layer_segment_received and lossy_layer_tick   ###
-    ### methods.                                                            ###
-    ###                                                                     ###
-    ### Note that because this is the server socket, and our (initial)      ###
-    ### implementation of bTCP is one-way reliable data transfer, there is  ###
-    ### no send() method available to the applications. You should still    ###
-    ### be able to send segments on the lossy layer, however, because       ###
-    ### of acknowledgements and synchronization. You should implement that  ###
-    ### above.                                                              ###
-    ###########################################################################
 
     def accept(self):
         """Accept and perform the bTCP three-way handshake to establish a
@@ -207,7 +152,7 @@ class BTCPServerSocket(BTCPSocket):
         self._state = BTCPStates.ACCEPTING
         print("SERVER ACCEPTING")
         while self._state:
-            
+
             if self._state == BTCPStates.SYN_RCVD:
                 print("SERVER SYN RCV")
                 print("SYN SEGMENT: ", self._SEQ, self._ACK)
@@ -218,22 +163,18 @@ class BTCPServerSocket(BTCPSocket):
         syn_ack = self.build_segment_header(self._SEQ, self._ACK, syn_set=True, ack_set=True,
                                             )
         self._lossy_layer.send_segment(syn_ack)
-        self._state = BTCPStates.SYN_SENT
-        print("SYN ACK SEGMENT: ",self._SEQ,self._ACK)
+        print("SYN ACK SEGMENT: ", self._SEQ, self._ACK)
 
         print("SERVER SEND ACK")
 
-        
-        """while self._state:
-            print(self._state)
+        self._state = BTCPStates.SYN_SENT
+        while self._state:
             if self._state == BTCPStates.ESTABLISHED:
                 print("SERVER EST")
                 print("EST SEGMENT: ", self._SEQ, self._ACK)
 
                 break
-            sleep(0.1)            
             continue
-        """
 
     def recv(self):
         """Return data that was received from the client to the application in
@@ -266,7 +207,6 @@ class BTCPServerSocket(BTCPSocket):
 
         Again, you should feel free to deviate from how this usually works.
         """
-
 
         # Rudimentary example implementation:
         # Empty the queue in a loop, reading into a larger bytearray object.

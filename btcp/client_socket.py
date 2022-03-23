@@ -41,28 +41,16 @@ class BTCPClientSocket(BTCPSocket):
         super().__init__(window, timeout)
         self._lossy_layer = LossyLayer(self, CLIENT_IP, CLIENT_PORT, SERVER_IP, SERVER_PORT)
         self._flag = False
+        self._s_window = None
         self._state = None
         self._SEQ = None
+        self._SEQ_first = None
         self._ACK = None
+        self._sent_packet = []
+
         # The data buffer used by send() to send data from the application
         # thread into the network thread. Bounded in size.
         self._sendbuf = queue.Queue(maxsize=1000)
-
-        self._window_size = 100
-        self._window_start = None
-        self._window_end = None
-
-    ###########################################################################
-    ### The following section is the interface between the transport layer  ###
-    ### and the lossy (network) layer. When a segment arrives, the lossy    ###
-    ### layer will call the lossy_layer_segment_received method "from the   ###
-    ### network thread". In that method you should handle the checking of   ###
-    ### the segment, and take other actions that should be taken upon its   ###
-    ### arrival.                                                            ###
-    ###                                                                     ###
-    ### Of course you can implement this using any helper methods you want  ###
-    ### to add.                                                             ###
-    ###########################################################################
 
     def lossy_layer_segment_received(self, segment):
         """Called by the lossy layer whenever a segment arrives.
@@ -82,23 +70,21 @@ class BTCPClientSocket(BTCPSocket):
         if self._state == BTCPStates.SYN_SENT:
             if flags == 6:  # SYN&ACK rcv
                 self._flag = False
-                self._SEQ = ack
-                self._ACK = seq + 1
-
-                self._window_start = ack
+                self._SEQ = seq+1
+                self._SEQ_first = seq
+                self._ACK = ack
+                self._s_window = self._SEQ + window
         if self._state == BTCPStates.FIN_SENT:
             if flags == 3:  # FIN&ACK rcv
                 self._flag = False
                 self._SEQ = seq
                 self._ACK = ack
-
         if self._state == BTCPStates.ESTABLISHED:
-            pass
-            #acknowledge that every sequence number <= to ack - 1 has been received.
-            #move window
-            #resend where necessary
-        
-        
+            if flags == 2:  # ACK rcv
+                if self._SEQ_first < ack < self._SEQ:
+                    while self._SEQ_first <= ack:
+                        self._SEQ_first += 1
+                        self._sent_packet.pop(0)
         try:
             pass
         except queue.Full:
@@ -144,36 +130,14 @@ class BTCPClientSocket(BTCPSocket):
                 datalen = len(chunk)
                 if datalen < PAYLOAD_SIZE:
                     chunk = chunk + b'\x00' * (PAYLOAD_SIZE - datalen)
-                segment = self.build_segment_header(0, 0, length=datalen) + chunk
+                segment = self.build_segment_header(self._SEQ, 0, length=datalen) + chunk
                 self._lossy_layer.send_segment(segment)
+                self._SEQ += 1
+                self._sent_packet.append(segment)
             except queue.Empty:
                 # No data was available for sending.
                 break
 
-    ###########################################################################
-    ### You're also building the socket API for the applications to use.    ###
-    ### The following section is the interface between the application      ###
-    ### layer and the transport layer. Applications call these methods to   ###
-    ### connect, shutdown (disconnect), send data, etc. Conceptually, this  ###
-    ### happens in "the application thread".                                ###
-    ###                                                                     ###
-    ### You *can*, from this application thread, send segments into the     ###
-    ### lossy layer, i.e. you can call LossyLayer.send_segment(segment)     ###
-    ### from these methods without ensuring that happens in the network     ###
-    ### thread. However, if you do want to do this from the network thread, ###
-    ### you should use the lossy_layer_tick() method above to ensure that   ###
-    ### segments can be sent out even if no segments arrive to trigger the  ###
-    ### call to lossy_layer_segment_received. When passing segments between ###
-    ### the application thread and the network thread, remember to use a    ###
-    ### Queue for its inherent thread safety.                               ###
-    ###                                                                     ###
-    ### Note that because this is the client socket, and our (initial)      ###
-    ### implementation of bTCP is one-way reliable data transfer, there is  ###
-    ### no recv() method available to the applications. You should still    ###
-    ### be able to receive segments on the lossy layer, however, because    ###
-    ### of acknowledgements and synchronization. You should implement that  ###
-    ### above.                                                              ###
-    ###########################################################################
     def connect(self):
         """Perform the bTCP three-way handshake to establish a connection.
 
@@ -190,15 +154,8 @@ class BTCPClientSocket(BTCPSocket):
         more advanced thread synchronization in this project.
         """
         self._SEQ = getrandbits(16)
-
-        self._window_start = self._SEQ
-        self._window_end = self._window_start + self._window_size -1 #both end and start of window inclusive
-
         syn_segment = self.build_segment_header(self._SEQ, 0, syn_set=True)
         self._lossy_layer.send_segment(syn_segment)
-
-        print("SYN SEGMENT: ",self._SEQ,self._ACK)
-        print("CLIENT SEND SYN")
         self._state = BTCPStates.SYN_SENT
         self._flag = True
         while self._flag:
@@ -206,11 +163,7 @@ class BTCPClientSocket(BTCPSocket):
             continue
         ack_segment = BTCPSocket.build_segment_header(self._ACK, self._SEQ, ack_set=True)
         self._lossy_layer.send_segment(ack_segment)
-        print("ACK SEGMENT: ",self._SEQ,self._ACK)
-        print("CLIENT SEND ACK")
         self._state = BTCPStates.ESTABLISHED
-        print("CONN EST")
-        print("EST SEGMENT: ",self._SEQ,self._ACK)
 
         return
 
@@ -245,6 +198,11 @@ class BTCPClientSocket(BTCPSocket):
         # Example with a finite buffer: a queue with at most 1000 chunks,
         # for a maximum of 985KiB data buffered to get turned into packets.
         # See BTCPSocket__init__() in btcp_socket.py for its construction.
+        while True:
+            if self._SEQ >= self._s_window:
+                continue
+            else:
+                break
         datalen = len(data)
         sent_bytes = 0
         while sent_bytes < datalen:
@@ -275,17 +233,14 @@ class BTCPClientSocket(BTCPSocket):
         """
         fin_segment = self.build_segment_header(self._SEQ, self._ACK, fin_set=True)
         self._lossy_layer.send_segment(fin_segment)
-        print("FIN SENT")
         self._state = BTCPStates.FIN_SENT
         self._flag = True
         while self._flag:
             sleep(0.1)  # 100ms
             continue
         ack_segment = BTCPSocket.build_segment_header(self._ACK, self._SEQ, ack_set=True)
-        print("ACK SENT")
         self._lossy_layer.send_segment(ack_segment)
         self._state = BTCPStates.CLOSED
-        print("CLOSED")
         return
 
     def close(self):
@@ -305,11 +260,11 @@ class BTCPClientSocket(BTCPSocket):
                 2. if so, destroy the resource.
             3. set the reference to None.
         """
-        
-        if self._lossy_layer is not None:          
-            self._lossy_layer.destroy()            
+
+        if self._lossy_layer is not None:
+            self._lossy_layer.destroy()
         self._lossy_layer = None
 
     def __del__(self):
-        """Destructor. Do not modify."""        
+        """Destructor. Do not modify."""
         self.close()
