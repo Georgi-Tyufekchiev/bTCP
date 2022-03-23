@@ -52,6 +52,11 @@ class BTCPClientSocket(BTCPSocket):
         # thread into the network thread. Bounded in size.
         self._sendbuf = queue.Queue(maxsize=1000)
 
+
+        self._window_size = 100
+        self._window_start = None
+        self._window_end = None
+
     def lossy_layer_segment_received(self, segment):
         """Called by the lossy layer whenever a segment arrives.
 
@@ -85,6 +90,14 @@ class BTCPClientSocket(BTCPSocket):
                     while self._SEQ_first <= ack:
                         self._SEQ_first += 1
                         self._sent_packet.pop(0)
+
+        if self._state == BTCPStates.ESTABLISHED:
+            pass
+            #acknowledge that every sequence number <= to ack - 1 has been received.
+            #move window
+            #resend where necessary
+
+            
         try:
             pass
         except queue.Full:
