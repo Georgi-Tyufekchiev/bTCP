@@ -47,15 +47,12 @@ class BTCPClientSocket(BTCPSocket):
         self._SEQ_first = None
         self._ACK = None
         self._sent_packet = []
+        self.count = 0
 
         # The data buffer used by send() to send data from the application
         # thread into the network thread. Bounded in size.
         self._sendbuf = queue.Queue(maxsize=1000)
 
-
-        self._window_size = 100
-        self._window_start = None
-        self._window_end = None
 
     def lossy_layer_segment_received(self, segment):
         """Called by the lossy layer whenever a segment arrives.
@@ -72,32 +69,39 @@ class BTCPClientSocket(BTCPSocket):
         Remember, we expect you to implement this *as a state machine!*
         """
         seq, ack, flags, window, datalen, checksum = self.unpack_segment_header(segment[:10])
+        if not BTCPSocket.in_cksum(segment, validity=True):
+            print("INVALID CHK")
+
+            return
         if self._state == BTCPStates.SYN_SENT:
             if flags == 6:  # SYN&ACK rcv
                 self._flag = False
-                self._SEQ = seq+1
+                self._SEQ = seq + 1
                 self._SEQ_first = seq
                 self._ACK = ack
-                self._s_window = self._SEQ + window
+                self._s_window = window
         if self._state == BTCPStates.FIN_SENT:
             if flags == 3:  # FIN&ACK rcv
                 self._flag = False
                 self._SEQ = seq
                 self._ACK = ack
         if self._state == BTCPStates.ESTABLISHED:
-            if flags == 2:  # ACK rcv
-                if self._SEQ_first < ack < self._SEQ:
-                    while self._SEQ_first <= ack:
+            if flags == 2 and self._SEQ_first != self._ACK:  # ACK rcv and not duplicate
+                self._ACK = ack
+                print("RCV ACK PACKET +", self._ACK)
+                if self._SEQ_first < self._ACK < self._SEQ:
+                    while self._SEQ_first <= self._ACK:
                         self._SEQ_first += 1
                         self._sent_packet.pop(0)
+            else:
+                print("RCV DUPLICATE ACK")
 
         if self._state == BTCPStates.ESTABLISHED:
             pass
-            #acknowledge that every sequence number <= to ack - 1 has been received.
-            #move window
-            #resend where necessary
+            # acknowledge that every sequence number <= to ack - 1 has been received.
+            # move window
+            # resend where necessary
 
-            
         try:
             pass
         except queue.Full:
@@ -144,8 +148,12 @@ class BTCPClientSocket(BTCPSocket):
                 if datalen < PAYLOAD_SIZE:
                     chunk = chunk + b'\x00' * (PAYLOAD_SIZE - datalen)
                 segment = self.build_segment_header(self._SEQ, 0, length=datalen) + chunk
+                checksum = BTCPSocket.in_cksum(segment)
+                segment = self.build_segment_header(self._SEQ, 0, checksum=checksum, length=datalen) + chunk
                 self._lossy_layer.send_segment(segment)
                 self._SEQ += 1
+                print("SEND PACKET + ", self._SEQ % 65535, self._ACK, self.count)
+                self.count += 1
                 self._sent_packet.append(segment)
             except queue.Empty:
                 # No data was available for sending.
@@ -167,14 +175,22 @@ class BTCPClientSocket(BTCPSocket):
         more advanced thread synchronization in this project.
         """
         self._SEQ = getrandbits(16)
-        syn_segment = self.build_segment_header(self._SEQ, 0, syn_set=True)
+
+        syn_segment = self.build_segment_header(self._SEQ, 0, syn_set=True) + 1008 * b'\x00'
+        checksum = BTCPSocket.in_cksum(syn_segment)
+        syn_segment = self.build_segment_header(self._SEQ, 0, checksum=checksum, syn_set=True) + 1008 * b'\x00'
+
         self._lossy_layer.send_segment(syn_segment)
         self._state = BTCPStates.SYN_SENT
         self._flag = True
         while self._flag:
             sleep(0.1)  # 100ms
             continue
-        ack_segment = BTCPSocket.build_segment_header(self._ACK, self._SEQ, ack_set=True)
+        ack_segment = BTCPSocket.build_segment_header(self._ACK, self._SEQ, ack_set=True) + 1008 * b'\x00'
+        checksum = BTCPSocket.in_cksum(ack_segment)
+        ack_segment = BTCPSocket.build_segment_header(self._ACK, self._SEQ, checksum=checksum,
+                                                      ack_set=True) + 1008 * b'\x00'
+
         self._lossy_layer.send_segment(ack_segment)
         self._state = BTCPStates.ESTABLISHED
 
@@ -211,11 +227,8 @@ class BTCPClientSocket(BTCPSocket):
         # Example with a finite buffer: a queue with at most 1000 chunks,
         # for a maximum of 985KiB data buffered to get turned into packets.
         # See BTCPSocket__init__() in btcp_socket.py for its construction.
-        while True:
-            if self._SEQ >= self._s_window:
-                continue
-            else:
-                break
+
+
         datalen = len(data)
         sent_bytes = 0
         while sent_bytes < datalen:
@@ -224,6 +237,11 @@ class BTCPClientSocket(BTCPSocket):
             chunk = data[sent_bytes:sent_bytes + PAYLOAD_SIZE]
             try:
                 self._sendbuf.put_nowait(chunk)
+                while True:
+                    if self._sendbuf.qsize() >= self._s_window:
+                        continue
+                    else:
+                        break
                 sent_bytes += len(chunk)
             except queue.Full:
                 break
