@@ -4,8 +4,6 @@ from btcp.constants import *
 from random import getrandbits
 import queue
 
-
-# LINE ADDED FOR GIT BEING A BITCH
 class BTCPServerSocket(BTCPSocket):
     """bTCP server socket
     A server application makes use of the services provided by bTCP by calling
@@ -78,6 +76,7 @@ class BTCPServerSocket(BTCPSocket):
             if flags == 4:  # SYN rcv
                 self._state = BTCPStates.SYN_RCVD
                 self._ACK = seq
+                #shouldn't we give a call to accept() here?
                 return
         if self._state == BTCPStates.SYN_SENT:
             if flags == 2:  # ACK rcv

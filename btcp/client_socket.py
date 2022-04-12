@@ -5,6 +5,7 @@ from btcp.lossy_layer import LossyLayer
 from btcp.constants import *
 from random import getrandbits
 import queue
+import time
 
 
 class BTCPClientSocket(BTCPSocket):
@@ -47,12 +48,16 @@ class BTCPClientSocket(BTCPSocket):
         self._SEQ_first = None
         self._ACK = None
         self._sent_packet = []
+        self._packet_timestamps = []
         self.count = 0
 
         # The data buffer used by send() to send data from the application
         # thread into the network thread. Bounded in size.
         self._sendbuf = queue.Queue(maxsize=1000)
 
+        self._window_size = 100
+        self._window_start = None
+        self._window_end = None
 
     def lossy_layer_segment_received(self, segment):
         """Called by the lossy layer whenever a segment arrives.
@@ -93,6 +98,8 @@ class BTCPClientSocket(BTCPSocket):
                     while self._SEQ_first <= self._ACK:
                         self._SEQ_first += 1
                         self._sent_packet.pop(0)
+                        self._packet_timestamps.pop(0)
+
             else:
                 print("RCV DUPLICATE ACK")
 
@@ -158,6 +165,33 @@ class BTCPClientSocket(BTCPSocket):
             except queue.Empty:
                 # No data was available for sending.
                 break
+
+        timeout = self.timeout_check()  #check for timeout
+        if timeout[0] == -1:            #no timeout
+            return
+        
+        for i in range(timeout[0], timeout[1] + 1):     #for every timeout first resend, then append new timestamp, then append packet to sent_packet, then remove first entry in both
+            self._lossy_layer.send_segment(self._sent_packet[0])
+            self._packet_timestamps.append(time.time())
+            self._sent_packet.append(self._sent_packet[0])
+            self._sent_packet.pop(0)
+            self._packet_timestamps.pop(0)
+
+
+    #checks whether packets have timed out, if so it returns a tuple (0, upperbound) which are indices in self._sent_packet
+    #if not packet timed out (-1,-1) is returned
+    def timeout_check(self):
+        i = 0
+        lower_bound = -1
+        upper_bound = -1
+        current_time = time.time()  
+        while i < len(self._packet_timestamps) and current_time - self._packet_timestamps[i] >= 1:   #timeout after 1 sec
+            lower_bound = 0
+            upper_bound = i
+            i += 1
+            current_time = time.time()
+        print("bounds: \t"+  str(lower_bound) + "\t" + str(upper_bound))
+        return (lower_bound, upper_bound)
 
     def connect(self):
         """Perform the bTCP three-way handshake to establish a connection.
