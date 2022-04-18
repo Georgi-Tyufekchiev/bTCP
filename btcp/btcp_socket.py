@@ -34,21 +34,17 @@ class BTCPSocket:
     methods that will definitely be useful for both sending and receiving side.
     """
 
-    def __init__(self, window, timeout, user):
+    def __init__(self, window, timeout):
+        self._lossy_layer = None
         self._window = window
+        self._window_control = 0
         self._timeout = timeout
-        self._user = user
-        if user == "client":
-            self._lossy_layer = LossyLayer(self, CLIENT_IP, CLIENT_PORT, SERVER_IP, SERVER_PORT)
-        elif user == "server":
-            self._lossy_layer = LossyLayer(self, SERVER_IP, SERVER_PORT, CLIENT_IP, CLIENT_PORT)
-        else:
-            raise Exception("Invalid type, should be server or client")
         self._flag = False
         self._state = None
-        self._SEQ = None
-        self._SEQ_first = None
-        self._ACK = None
+        self._SEQ = 0
+        # self._SEQ_first = 0
+        self._expected_seq = 0
+        self._ACK = 0
         self._sent_packet = []
 
         # The data buffer used by send() to send data from the application
@@ -56,24 +52,18 @@ class BTCPSocket:
         self._sendbuf = queue.Queue(maxsize=1000)
         self._recvbuf = queue.Queue(maxsize=1000)
 
+    def bind(self, localIP, localPort, remoteIP, remotePort):
+        """
+        Bind the socket to the proper IPs and Ports
+        """
+        self._lossy_layer = LossyLayer(self, localIP, localPort, remoteIP, remotePort)
+
     def lossy_layer_segment_received(self, segment):
         """Called by the lossy layer whenever a segment arrives.
-
-        Things you should expect to handle here (or in helper methods called
-        from here):
-            - checksum verification (and deciding what to do if it fails)
-            - receiving syn/ack during handshake
-            - receiving ack and registering the corresponding segment as being
-              acknowledged
-            - receiving fin/ack during termination
-            - any other handling of the header received from the server
-
-        Remember, we expect you to implement this *as a state machine!*
         """
         seq, ack, flags, window, datalen, checksum = self.unpack_segment_header(segment[:10])
         if not BTCPSocket.in_cksum(segment, validity=True):
             print("INVALID CHK")
-
             return
         if self._state == BTCPStates.ACCEPTING:
             if flags == 4:  # SYN rcv
@@ -83,68 +73,63 @@ class BTCPSocket:
         if self._state == BTCPStates.SYN_SENT:
             if flags == 6:  # SYN&ACK rcv
                 self._flag = False
-                self._SEQ = seq + 1
-                self._SEQ_first = seq
-                self._ACK = ack
+                self._ACK = seq
                 self._window = window
-            if flags == 2:  # ACK rcv
-                self._ACK = ack
-                self._SEQ = seq + 1
-                self._state = BTCPStates.ESTABLISHED
-                print("SEQ ACK ", self._SEQ, self._ACK)
+                self._window_control = window
+                # self._SEQ_first = (self._SEQ_first + 1) % self._window
                 return
+            if flags == 2:  # ACK rcv
+                self._expected_seq = (seq + 1) % self._window
+                self._ACK = self._expected_seq
+                self._state = BTCPStates.ESTABLISHED
+                return
+
+        if self._state == BTCPStates.ESTABLISHED and flags == 2:
+            self._ACK = ack
+            # if self._SEQ_first <= self._ACK < self._SEQ:
+            print("RCV ACK PACKET +", self._ACK)
+            self._window_control += 1
+            self._sent_packet.pop(0)
+
+        if self._state == BTCPStates.ESTABLISHED and flags == 0:
+            if seq == self._expected_seq:
+                try:
+                    self._recvbuf.put_nowait(segment[10:(10 + datalen)])
+                except queue.Full:
+                    self._expected_seq = (self._expected_seq - 1) % self._window
+
+                self._ACK = self._expected_seq
+                self._expected_seq = (self._expected_seq + 1) % self._window
+                self.respond()
+                print("SEND ACK FOR PACKET + ", self._ACK)
+
+            else:  # not expected segment, drop it and send same old ack again.
+                print("RECEIVED NOT EXPECTED PACKET - DROP ", self._ACK)
+                self.respond()
+        if flags == 1:  # FIN rcv
+            self._state = BTCPStates.CLOSING
+            self.respond(fin_flag=True)
+            return
         if self._state == BTCPStates.FIN_SENT:
             if flags == 3:  # FIN&ACK rcv
                 self._flag = False
                 self._SEQ = seq
                 self._ACK = ack
-        if self._state == BTCPStates.ESTABLISHED and not flags == 1:
-            if self._user == "client":
-                if flags == 2:  # ACK rcv
-                    if self._SEQ_first != ack:  # not duplicate
-                        self._ACK = ack
-                        print("RCV ACK PACKET +", self._ACK)
-                        if self._SEQ_first < self._ACK < self._SEQ:
-                            while self._SEQ_first <= self._ACK:
-                                self._SEQ_first += 1
-                                self._window += 1
-                                self._sent_packet.pop(0)
-                        else:
-                            print("RCV DUPLICATE ACK")
-            if self._user == "server":
-                if seq == self._ACK % 65535:  # sequence number segment is the expected sequence number meaning no loss of packet
-                    try:
-                        self._recvbuf.put_nowait(segment[10:(10 + datalen)])
-                    except queue.Full:
-                        self._ACK -= 1  # decrease ack by one to not acknowledge dropped data
-                    self._ACK += 1
-                    self.respond()
-                    print("SEND ACK FOR PACKET + ", self._ACK)
-
-                    self._SEQ += 1
-                else:  # not expected segment, drop it and send same old ack again.
-                    print("RECEIVED NOT EXPECTED PACKET - DROP ", self._ACK, seq)
-                    self.respond()
+                return
+        if self._state == BTCPStates.CLOSING:
+            if flags == 2:  # ACK rcv
+                self._state = BTCPStates.CLOSED
+                return
 
     def respond(self, ack_flag=True, fin_flag=False, ):
-        segment = self.build_segment_header(self._SEQ, self._ACK, fin_set=fin_flag, ack_set=ack_flag, ) + 1008 * b'\x00'
-        checksum = BTCPSocket.in_cksum(segment)
-        segment = self.build_segment_header(self._SEQ, self._ACK, checksum=checksum, fin_set=fin_flag,
-                                            ack_set=ack_flag) + 1008 * b'\x00'
-
+        segment = self.make_packet(self._SEQ, self._ACK, NO_DATA, self._window, fin_flag=fin_flag, ack_flag=ack_flag)
         self._lossy_layer.send_segment(segment)
         return
 
     @staticmethod
     def in_cksum(segment, validity=False):
-        """Compute the internet checksum of the segment given as argument.
-        Consult lecture 3 for details.
-
-        Our bTCP implementation always has an even number of bytes in a segment.
-
-        Remember that, when computing the checksum value before *sending* the
-        segment, the checksum field in the header should be set to 0x0000, and
-        then the resulting checksum should be put in its place.
+        """Compute the internet checksum of the segment given as argument or check the validity of the arrived segment.
+        The code is taken from the correct version of the packet_sniffer.py provided to us.
         """
         if not segment:
             return 0x0000
@@ -169,24 +154,6 @@ class BTCPSocket:
                              syn_set=False, ack_set=False, fin_set=False,
                              window=0x01, length=0, checksum=0):
         """Pack the method arguments into a valid bTCP header using struct.pack
-
-        This method is given because historically students had a lot of trouble
-        figuring out how to pack and unpack values into / out of the header.
-        We have *not* provided an implementation of the corresponding unpack
-        method (see below), so inspect the code, look at the documentation for
-        struct.pack, and figure out what this does, so you can implement the
-        unpack method yourself.
-
-        Of course, you are free to implement it differently, as long as you
-        do so correctly *and respect the network byte order*.
-
-        You are allowed to change the SYN, ACK, and FIN flag locations in the
-        flags byte, but make sure to do so correctly everywhere you pack and
-        unpack them.
-
-        The method is written to have sane defaults for the arguments, so
-        you don't have to always set all flags explicitly true/false, or give
-        a checksum of 0 when creating the header for checksum computation.
         """
         flag_byte = syn_set << 2 | ack_set << 1 | fin_set
         return struct.pack("!HHBBHH",
@@ -195,10 +162,6 @@ class BTCPSocket:
     @staticmethod
     def unpack_segment_header(header):
         """Unpack the individual bTCP header field values from the header.
-
-        Remember that Python supports multiple return values through automatic
-        tupling, so it's easy to simply return all of them in one go rather
-        than make a separate method for every individual field.
         """
         seqnum, ack, flags, window, datalen, checksum = struct.unpack("!HHBBHH", header)
         return seqnum, ack, flags, window, datalen, checksum
@@ -233,6 +196,7 @@ class BTCPSocket:
         # is available.
         # You should be checking whether there's space in the window as well,
         # and storing the segments for retransmission somewhere.
+
         while True:
             try:
                 # Get a chunk of data from the buffer, if available.
@@ -240,119 +204,59 @@ class BTCPSocket:
                 datalen = len(chunk)
                 if datalen < PAYLOAD_SIZE:
                     chunk = chunk + b'\x00' * (PAYLOAD_SIZE - datalen)
-                segment = self.build_segment_header(self._SEQ, 0, length=datalen) + chunk
-                checksum = BTCPSocket.in_cksum(segment)
-                segment = self.build_segment_header(self._SEQ, 0, checksum=checksum, length=datalen) + chunk
-                self._lossy_layer.send_segment(segment)
                 self._SEQ += 1
-                print("SEND PACKET + ", self._SEQ % 65535, self._ACK)
+                segment = self.make_packet(self._SEQ % self._window, 0, chunk, self._window, length=datalen)
+                self._lossy_layer.send_segment(segment)
                 self._sent_packet.append(segment)
+
+                self._window_control -= 1
+                while True:
+                    if self._window_control == 0:
+                        print("BLOCK")
+                        return
+                    else:
+                        break
+                print("SEND PACKET + ", self._SEQ % self._window)
             except queue.Empty:
                 # No data was available for sending.
                 break
 
     def connect(self):
         """Perform the bTCP three-way handshake to establish a connection.
-
-        connect should *block* (i.e. not return) until the connection has been
-        successfully established or the connection attempt is aborted. You will
-        need some coordination between the application thread and the network
-        thread for this, because the syn/ack from the server will be received
-        in the network thread.
-
-        Hint: assigning to a boolean or enum attribute in thread A and reading
-        it in a loop in thread B (preferably with a short sleep to avoid
-        wasting a lot of CPU time) ensures that thread B will wait until the
-        boolean or enum has the expected value. We do not think you will need
-        more advanced thread synchronization in this project.
         """
         self._SEQ = getrandbits(16)
 
-        syn_segment = self.build_segment_header(self._SEQ, 0, syn_set=True) + 1008 * b'\x00'
-        checksum = BTCPSocket.in_cksum(syn_segment)
-        syn_segment = self.build_segment_header(self._SEQ, 0, checksum=checksum, syn_set=True) + 1008 * b'\x00'
-
+        syn_segment = self.make_packet(self._SEQ, 0, NO_DATA, self._window, syn_flag=True)
         self._lossy_layer.send_segment(syn_segment)
         self._state = BTCPStates.SYN_SENT
         self._flag = True
-        while self._flag:
+        while self._flag:  # Wait to rcv SYN&ACK
             sleep(0.1)  # 100ms
             continue
-        ack_segment = BTCPSocket.build_segment_header(self._ACK, self._SEQ, ack_set=True) + 1008 * b'\x00'
-        checksum = BTCPSocket.in_cksum(ack_segment)
-        ack_segment = BTCPSocket.build_segment_header(self._ACK, self._SEQ, checksum=checksum,
-                                                      ack_set=True) + 1008 * b'\x00'
 
+        ack_segment = self.make_packet(self._SEQ, self._ACK, NO_DATA, self._window, ack_flag=True)
         self._lossy_layer.send_segment(ack_segment)
         self._state = BTCPStates.ESTABLISHED
-
         return
 
     def accept(self):
         """Accept and perform the bTCP three-way handshake to establish a
         connection.
-
-        accept should *block* (i.e. not return) until a connection has been
-        successfully established (or some timeout is reached, if you want. Feel
-        free to add a timeout to the arguments). You will need some
-        coordination between the application thread and the network thread for
-        this, because the syn and final ack from the client will be received in
-        the network thread.
-
-        Hint: assigning to a boolean or enum attribute in thread A and reading
-        it in a loop in thread B (preferably with a short sleep to avoid
-        wasting a lot of CPU time) ensures that thread B will wait until the
-        boolean or enum has the expected value. We do not think you will need
-        more advanced thread synchronization in this project.
         """
         self._state = BTCPStates.ACCEPTING
-        while self._state:
-
+        while self._state:  # Wait for client
             if self._state == BTCPStates.SYN_RCVD:
                 break
             continue
         self._SEQ = getrandbits(16)
-        syn_ack = self.build_segment_header(self._SEQ, self._ACK, window=self._window, syn_set=True,
-                                            ack_set=True, ) + 1008 * b'\x00'
-        checksum = BTCPSocket.in_cksum(syn_ack)
-        syn_ack = self.build_segment_header(self._SEQ, self._ACK, window=self._window, checksum=checksum, syn_set=True,
-                                            ack_set=True) + 1008 * b'\x00'
-
+        syn_ack = self.make_packet(self._SEQ, self._ACK, NO_DATA, self._window, syn_flag=True, ack_flag=True)
         self._lossy_layer.send_segment(syn_ack)
         self._state = BTCPStates.SYN_SENT
 
     def send(self, data):
         """Send data originating from the application in a reliable way to the
         server.
-
-        This method should *NOT* block waiting for acknowledgement of the data.
-
-
-        You are free to implement this however you like, but the following
-        explanation may help to understand how sockets *usually* behave and you
-        may choose to follow this concept as well:
-
-        The way this usually works is that "send" operates on a "send buffer".
-        Once (part of) the data has been successfully put "in the send buffer",
-        the send method returns the number of bytes it was able to put in the
-        buffer. The actual sending of the data, i.e. turning it into segments
-        and sending the segments into the lossy layer, happens *outside* of the
-        send method (e.g. in the network thread).
-        If the socket does not have enough buffer space available, it is up to
-        the application to retry sending the bytes it was not able to buffer
-        for sending.
-
-        Again, you should feel free to deviate from how this usually works.
-        Note that our rudimentary implementation here already chunks the data
-        in maximum 1008-byte bytes objects because that's the maximum a segment
-        can carry. If a chunk is smaller we do *not* pad it here, that gets
-        done later.
         """
-
-        # Example with a finite buffer: a queue with at most 1000 chunks,
-        # for a maximum of 985KiB data buffered to get turned into packets.
-        # See BTCPSocket__init__() in btcp_socket.py for its construction.
-
         datalen = len(data)
         sent_bytes = 0
         while sent_bytes < datalen:
@@ -361,13 +265,6 @@ class BTCPSocket:
             chunk = data[sent_bytes:sent_bytes + PAYLOAD_SIZE]
             try:
                 self._sendbuf.put_nowait(chunk)
-                self._window -= 1
-                while True:
-                    if self._window == 0:
-                        continue
-                    else:
-                        break
-
                 sent_bytes += len(chunk)
             except queue.Full:
                 break
@@ -381,38 +278,7 @@ class BTCPSocket:
         should block waiting for more data to arrive. If the connection has
         been terminated, this method should return with no data (e.g. an empty
         bytes b'').
-
-        If you want, you can add an argument to this method stating how many
-        bytes you want to receive in one go at the most (but this is not
-        required for this project).
-
-        You are free to implement this however you like, but the following
-        explanation may help to understand how sockets *usually* behave and you
-        may choose to follow this concept as well:
-
-        The way this usually works is that "recv" operates on a "receive
-        buffer". Once data has been successfully received and acknowledged by
-        the transport layer, it is put "in the receive buffer". A call to recv
-        will simply return data already in the receive buffer to the
-        application.  If no data is available at all, the method will block
-        until at least *some* data can be returned.
-        The actual receiving of the data, i.e. reading the segments, sending
-        acknowledgements for them, reordering them, etc., happens *outside* of
-        the recv method (e.g. in the network thread).
-        Because of this blocking behaviour, an *empty* result from recv signals
-        that the connection has been terminated.
-
-        Again, you should feel free to deviate from how this usually works.
         """
-
-        # Rudimentary example implementation:
-        # Empty the queue in a loop, reading into a larger bytearray object.
-        # Once empty, return the data as bytes.
-        # If no data is received for 10 seconds, this returns no data and thus
-        # signals disconnection to the server application.
-        # Proper handling should use the bTCP state machine to check that the
-        # client has disconnected when a timeout happens, and keep blocking
-        # until data has actually been received if it's still connected.
         data = bytearray()
         try:
             # Wait until one segment becomes available in the buffer, or
@@ -433,27 +299,18 @@ class BTCPSocket:
 
     def shutdown(self):
         """Perform the bTCP three-way finish to shutdown the connection.
-
-        shutdown should *block* (i.e. not return) until the connection has been
-        successfully terminated or the disconnect attempt is aborted. You will
-        need some coordination between the application thread and the network
-        thread for this, because the fin/ack from the server will be received
-        in the network thread.
-
-        Hint: assigning to a boolean or enum attribute in thread A and reading
-        it in a loop in thread B (preferably with a short sleep to avoid
-        wasting a lot of CPU time) ensures that thread B will wait until the
-        boolean or enum has the expected value. We do not think you will need
-        more advanced thread synchronization in this project.
         """
-        fin_segment = self.build_segment_header(self._SEQ, self._ACK, fin_set=True)
+
+        fin_segment = self.make_packet(self._SEQ % self._window, 0, NO_DATA, self._window, fin_flag=True)
         self._lossy_layer.send_segment(fin_segment)
         self._state = BTCPStates.FIN_SENT
         self._flag = True
-        while self._flag:
+        while self._flag:  # Wait for FIN&ACK
+            print("Closing")
             sleep(0.1)  # 100ms
             continue
-        ack_segment = BTCPSocket.build_segment_header(self._ACK, self._SEQ, ack_set=True)
+
+        ack_segment = self.make_packet(self._SEQ % self._window, self._ACK, NO_DATA, self._window, ack_flag=True)
         self._lossy_layer.send_segment(ack_segment)
         self._state = BTCPStates.CLOSED
         return
@@ -461,19 +318,6 @@ class BTCPSocket:
     def close(self):
         """Cleans up any internal state by at least destroying the instance of
         the lossy layer in use. Also called by the destructor of this socket.
-
-        Do not confuse with shutdown, which disconnects the connection.
-        close destroys *local* resources, and should only be called *after*
-        shutdown.
-
-        Probably does not need to be modified, but if you do, be careful to
-        gate all calls to destroy resources with checks that destruction is
-        valid at this point -- this method will also be called by the
-        destructor itself. The easiest way of doing this is shown by the
-        existing code:
-            1. check whether the reference to the resource is not None.
-                2. if so, destroy the resource.
-            3. set the reference to None.
         """
 
         if self._lossy_layer is not None:
@@ -483,3 +327,16 @@ class BTCPSocket:
     def __del__(self):
         """Destructor. Do not modify."""
         self.close()
+
+    def make_packet(self, SEQ: int, ACK: int, data: bytes, window: int, ack_flag=False, syn_flag=False, fin_flag=False,
+                    length=0):
+        """
+        Create a packet with its checksum
+        """
+        packet = BTCPSocket.build_segment_header(SEQ, ACK, window=window, ack_set=ack_flag, syn_set=syn_flag,
+                                                 fin_set=fin_flag, length=length) + data
+        checksum = BTCPSocket.in_cksum(packet)
+        packet = BTCPSocket.build_segment_header(SEQ, ACK, window=window, checksum=checksum, ack_set=ack_flag,
+                                                 syn_set=syn_flag,
+                                                 fin_set=fin_flag, length=length) + data
+        return packet
