@@ -51,6 +51,7 @@ class BTCPSocket:
         self._count = 0
         self._count2 = 0
 
+        self._resend = {}
         self._packet_timestamps = []
         self._sent_packet = []
 
@@ -109,24 +110,27 @@ class BTCPSocket:
 
         if self._state == BTCPStates.ESTABLISHED and flags == 2:
             if ack == self._last_ACK:
-                if self._count_drop == 3 and len(self._sent_packet) != 0:
-                    print("DROP ACK", ack)
-                    self._count_drop = 0
-                    self.timeout((0,len(self._sent_packet)))
-                self._count_drop+=1
+                # if self._count_drop == 3 and len(self._sent_packet) != 0:
+                print("DROP ACK", ack)
+                self._count_drop += 1
                 return
 
-            if self._last_ACK > ack: # 99 - 105
+            if self._last_ACK > ack:  # 99 - 105
                 ack += self._window
                 print("HIT SPECIAL CASE ack lack", ack, self._last_ACK)
-# 0 < 14
-            while self._last_ACK < ack and len(self._sent_packet) != 0:
+            # 0 < 14
+            while self._last_ACK < ack:
                 print("RCV ack {} count {} and lack {}".format(ack, seq, self._last_ACK))
+                self._last_ACK = self._last_ACK + 1
 
                 self._window_control += 1
-                self._sent_packet.pop(0)
+                # print(self._resend)
+
+                self._resend.pop(self._last_ACK % self._window)
+                # self._sent_packet.pop(0)
                 self._packet_timestamps.pop(0)
-                self._last_ACK = self._last_ACK+ 1
+
+            self._last_ACK %= self._window
             return
 
         if self._state == BTCPStates.ESTABLISHED and flags == 0:
@@ -246,7 +250,12 @@ class BTCPSocket:
         if self._user == BTCPStates.SERVER:
             return
         while True:
-            self.check_timeout()
+            if self._count_drop >= 3:
+                self._count_drop = 0
+                self.timeout()
+
+            if len(self._packet_timestamps) != 0:
+                self.check_timeout()
 
             try:
                 # Get a chunk of data from the buffer, if available.
@@ -263,7 +272,8 @@ class BTCPSocket:
                 self._count += 1
                 self._packet_timestamps.append(time.time())
                 self._lossy_layer.send_segment(segment)
-                self._sent_packet.append(segment)
+                # self._sent_packet.append(segment)
+                self._resend[self._SEQ % self._window] = segment
                 print("PACKET seq {} & count {} ".format(self._SEQ % self._window, self._count))
 
                 self._window_control -= 1
@@ -277,20 +287,21 @@ class BTCPSocket:
         timeout = self.get_timeout()  # check for timeout
         if timeout[0] != -1:  # timeout
             print("TIMEOUT")
-            self.timeout(timeout)
+            self.timeout()
 
-    def timeout(self, timeout: tuple):
+    def timeout(self):
         """
          # for every timeout first resend, then append new timestamp, then append packet to sent_packet,
          then remove first entry in both
         """
-        print("TIMEOUT PACKS FROM {} TO {}:".format(timeout[0], timeout[1]))
-
-        for i in range(timeout[0], timeout[1] + 1):
-            self._lossy_layer.send_segment(self._sent_packet[0])
+        print("TIMEOUT PACKS:")
+        sent_packet = self._resend.values()
+        # print("DIC###",sent_packet)
+        for i in sent_packet:
+            self._lossy_layer.send_segment(i)
             self._packet_timestamps.append(time.time())
-            self._sent_packet.append(self._sent_packet[0])
-            self._sent_packet.pop(0)
+            # self._sent_packet.append(self._sent_packet[0])
+            # self._sent_packet.pop(0)
             self._packet_timestamps.pop(0)
 
     def get_timeout(self):
@@ -298,7 +309,8 @@ class BTCPSocket:
         lower_bound = -1
         upper_bound = -1
         current_time = time.time()
-        while i < len(self._packet_timestamps) and current_time - self._packet_timestamps[i] >= 1:  # timeout after 1 sec
+        while i < len(self._packet_timestamps) and current_time - self._packet_timestamps[
+            i] >= 1:  # timeout after 1 sec
             lower_bound = 0
             upper_bound = i
             i += 1
