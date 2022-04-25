@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
-
 import argparse
 import time
 from btcp.client_socket import BTCPClientSocket
+from btcp.btcp_socket import *
 
 """This exposes a constant bytes object called TEST_BYTES_128MIB which, as the
 name suggests, is 128 MiB in size. You can send it, receive it, and check it
@@ -54,19 +53,17 @@ def btcp_file_transfer_client():
                         type=int, default=100)
     parser.add_argument("-i", "--input",
                         help="File to send",
-                        default="large_input.py")
+                        default="testFile.py")
     args = parser.parse_args()
 
     # Create a bTCP client socket with the given window size and timeout value
-    s = BTCPClientSocket(args.window, args.timeout)
+    s = BTCPSocket(args.window, args.timeout)
+    s.bind(CLIENT_IP, CLIENT_PORT, SERVER_IP, SERVER_PORT)
 
     # Connect. By default this doesn't actually do anything: our rudimentary
     # implementation relies on you starting the server before the client,
     # and just dumps the entire file into the network immediately.
     s.connect()
-    s.shutdown()
-    s.close()
-    return
 
     # Actually open the file, read the file, and send the data.
     with open(args.input, 'rb') as infile:
@@ -99,6 +96,7 @@ def btcp_file_transfer_client():
 
     # Disconnect, since we're done reading the file and done sending.
     # Note that by default this doesn't do *anything*.
+    sleep(10)
     s.shutdown()
 
     # Clean up any state

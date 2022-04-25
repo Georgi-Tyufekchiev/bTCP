@@ -1,7 +1,6 @@
-#!/usr/bin/env python3
-
 import argparse
 from btcp.server_socket import BTCPServerSocket
+from btcp.btcp_socket import *
 
 """This exposes a constant bytes object called TEST_BYTES_128MIB which, as the
 name suggests, is 128 MiB in size. You can send it, receive it, and check it
@@ -47,7 +46,7 @@ def btcp_file_transfer_server():
     parser = argparse.ArgumentParser()
     parser.add_argument("-w", "--window",
                         help="Define bTCP window size",
-                        type=int, default=100)
+                        type=int, default=200)
     parser.add_argument("-t", "--timeout",
                         help="Define bTCP timeout in milliseconds",
                         type=int, default=100)
@@ -57,7 +56,8 @@ def btcp_file_transfer_server():
     args = parser.parse_args()
 
     # Create a bTCP server socket
-    s = BTCPServerSocket(args.window, args.timeout)
+    s = BTCPSocket(args.window, args.timeout)
+    s.bind(SERVER_IP, SERVER_PORT, CLIENT_IP, CLIENT_PORT)
 
     # Accept the connection. By default this doesn't actually do anything: our
     # rudimentary implementation relies on you starting the server before the
@@ -72,7 +72,7 @@ def btcp_file_transfer_server():
         # expression operator instead:
         # while recvdata := s.recv():
         recvdata = s.recv()
-        while recvdata:
+        while True:
             outfile.write(recvdata)
             # Read new data from the socket.
             recvdata = s.recv()
