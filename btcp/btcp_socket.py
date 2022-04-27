@@ -1,5 +1,6 @@
 import queue
 import struct
+import sys
 import time
 from enum import Enum
 from random import getrandbits
@@ -47,18 +48,17 @@ class BTCPSocket:
         self._expected_seq = 0
         self._last_ACK = 0
         self._ACK = 0
-        self._count_drop = 0
-        self._count = 0
-        self._count2 = 0
+        self._retries = 0
+        self._ack_drop = 0
+        self._packet_drop = 0
 
-        self._resend = {}
+        self._packet_sent = {}
         self._packet_timestamps = []
-        self._sent_packet = []
 
         # The data buffer used by send() to send data from the application
         # thread into the network thread. Bounded in size.
-        self._sendbuf = queue.Queue(maxsize=1000)
-        self._recvbuf = queue.Queue(maxsize=1000)
+        self._sendbuf = queue.Queue(maxsize=8192)
+        self._recvbuf = queue.Queue(maxsize=8192)
 
     def bind(self, localIP, localPort, remoteIP, remotePort):
         """
@@ -75,13 +75,12 @@ class BTCPSocket:
         """
         seq, ack, flags, window, datalen, checksum = self.unpack_segment_header(segment[:10])
         if not BTCPSocket.in_cksum(segment, validity=True):
-            if flags == 0:
-                print("CORRUPT FROM CLIENT", seq)
-                #self._ACK = (self._expected_seq - 1) % MAX_VALUE
+            # Perform checksum validation. If it is invalid drop the packet
+            # If it is received on the server side send an ACK with the previous correctly received packet
+            if flags == 0 or (flags == 1 and self._state != BTCPStates.FIN_SENT):
                 self.respond()
                 return
             elif flags == 2:
-                print("CORRUPT FROM SERVER", ack)
                 return
 
         if self._state == BTCPStates.ACCEPTING:
@@ -91,16 +90,18 @@ class BTCPSocket:
                 return
         if self._state == BTCPStates.SYN_SENT:
             if flags == 6:  # SYN&ACK rcv
-                print("SYN&ACK!!!!!!!")
                 try:
-                    self._sent_packet.pop(0)
+                    # Try-except is due to packet duplication
+                    self._packet_sent.pop(self._SEQ)
                     self._packet_timestamps.pop(0)
                 except IndexError:
-                    print("POPPING 0 FAILED IN SYNACK")
-                self._flag = False
+                    pass
+                except KeyError:
+                    pass
+                self._flag = False  # Signal to the client SYN&ACK was rcv
                 self._ACK = seq
                 self._window = window
-                self._window_control = window
+                self._window_control = window*3
                 return
             if flags == 2:  # ACK rcv
                 self._expected_seq = (seq + 1) % MAX_VALUE
@@ -110,35 +111,34 @@ class BTCPSocket:
 
         if self._state == BTCPStates.ESTABLISHED and flags == 2 and self._user == BTCPStates.CLIENT:
             if ack == self._last_ACK:
-                # if self._count_drop == 3 and len(self._sent_packet) != 0:
-                print("DROP ACK", ack)
-                self._count_drop += 1
+                # Drop duplicate ACK. The first 3 ACK will trigger timeout. Every 3rd ACK will trigger the lossy
+                # layer, which will trigger check_timeout()
+                self._ack_drop += 1
+                if self._ack_drop == 3:
+                    self.timeout()
+                    return
+                if self._ack_drop % 3 == 0:
+                    self.lossy_layer_tick()
+                    return
                 return
-            loops = ack - self._last_ACK
-
-            if loops <0:  # 99 - 105
+            loops = ack - self._last_ACK  # Allows cumulative ACK when the ACK > Last ACK
+            if loops < 0:
                 loops += MAX_VALUE
-                print("HIT SPECIAL CASE ack lack", ack, self._last_ACK)
 
-            if loops > self._window:
+            if loops > self._window * 3:
                 return
-            # 0 < 14
+            self._ack_drop = 0
             while loops > 0:
-                print("RCV ack {} count {} and lack {}".format(ack, seq, self._last_ACK))
-                print("remaining loops: " + str(loops))
+                # pop the segment in the dictionary corresponding to the last ACK
+                # pop the timer
                 self._last_ACK = (self._last_ACK + 1) % MAX_VALUE
-
                 self._window_control += 1
-                loops -=1
-                # print(self._resend)
-
-                #self._resend.pop(self._last_ACK % MAX_VALUE)
+                loops -= 1
+                self._packet_sent.pop(self._last_ACK % MAX_VALUE)
                 try:
-                    self._sent_packet.pop(0)
                     self._packet_timestamps.pop(0)
                 except IndexError:
                     pass
-
             self._last_ACK %= MAX_VALUE
             return
 
@@ -151,25 +151,25 @@ class BTCPSocket:
 
                 self._ACK = self._expected_seq
                 self._expected_seq = (self._expected_seq + 1) % MAX_VALUE
-                print("SEND ack {} and count {}  ".format(self._ACK, self._count2))
-
+                print("SEND ack {}".format(self._ACK),file=sys.stderr)
+                self._packet_drop = 0
                 self.respond()
                 return
 
             else:  # not expected segment, drop it and send same old ack again.
-                print("DROP count {} seq {} expseq {}".format(ack, seq, self._expected_seq))
-                self.respond()
+                self._packet_drop += 1
+                if self._packet_drop % 3 == 0:
+                    # Send ACK every 3rd drop in order to reduce overhead
+                    self.respond()
                 return
         if flags == 1:  # FIN rcv
-            self._state = BTCPStates.CLOSING
-            print("FIN RCV ############################")
             self.respond(fin_flag=True)
             return
         if self._state == BTCPStates.FIN_SENT:
             if flags == 3:  # FIN&ACK rcv
-                print("FIN ACK RCV !!!!!!!!!!!!!!!!!!!!!!!!")
                 try:
-                    self._sent_packet.pop(0)
+                    # Try-except due to pack duplication
+                    self._packet_sent.pop(self._SEQ%MAX_VALUE)
                     self._packet_timestamps.pop(0)
                 except IndexError:
                     pass
@@ -177,16 +177,17 @@ class BTCPSocket:
                 self._SEQ = seq
                 self._ACK = ack
                 return
-        if self._state == BTCPStates.CLOSING:
+        if self._state == BTCPStates.CLOSED:
             if flags == 2:  # ACK rcv
-                print("ACK RCV @@@@@@@@@@@@@@@@@@@@@@")
                 self._state = BTCPStates.CLOSED
                 return
 
     def respond(self, ack_flag=True, fin_flag=False, ):
-        segment = self.make_packet(self._count2 % 65535, self._ACK, NO_DATA, self._window, fin_flag=fin_flag,
+        """
+        Used by the server to send ACK packets and FIN&ACK packet
+        """
+        segment = self.make_packet(0, self._ACK, NO_DATA, self._window, fin_flag=fin_flag,
                                    ack_flag=ack_flag)
-        self._count2 += 1
         self._lossy_layer.send_segment(segment)
         return
 
@@ -231,133 +232,88 @@ class BTCPSocket:
         return seqnum, ack, flags, window, datalen, checksum
 
     def lossy_layer_tick(self):
-        """Called by the lossy layer whenever no segment has arrived for
-        TIMER_TICK milliseconds. Defaults to 100ms, can be set in constants.py.
-        NOTE: Will NOT be called if segments are arriving; do not rely on
-        simply counting calls to this method for an accurate timeout. If 10
-        segments arrive, each 99 ms apart, this method will NOT be called for
-        over a second!
-        The primary use for this method is to be able to do things in the
-        "network thread" even while no segments are arriving -- which would
-        otherwise trigger a call to lossy_layer_segment_received.
-        For example, checking for timeouts on acknowledgement of previously
-        sent segments -- to trigger retransmission -- should work even if no
-        segments are being received. Although you can't count these ticks
-        themselves for the timeout, you can trigger the check from here.
-        You will probably see some code duplication of code that doesn't handle
-        the incoming segment among lossy_layer_segment_received and
-        lossy_layer_tick. That kind of duplicated code would be a good
-        candidate to put in a helper method which can be called from either
-        lossy_layer_segment_received or lossy_layer_tick.
         """
-
-        # Send all data available for sending.
-        # Relies on an eventual exception to break from the loop when no data
-        # is available.
-        # You should be checking whether there's space in the window as well,
-        # and storing the segments for retransmission somewhere.
+        Used by the client to send packets, check for timeouts and control the sending window
+        """
         if self._user == BTCPStates.SERVER:
             return
         while True:
-            if self._count_drop >= 3:
-                self._count_drop = 0
-                self.timeout((0, len(self._sent_packet)-1))
 
             if len(self._packet_timestamps) != 0:
                 self.check_timeout()
 
             try:
-                # Get a chunk of data from the buffer, if available.
                 if self._window_control <= 0:
-                    print("BLOCK")
                     break
                 chunk = self._sendbuf.get_nowait()
                 datalen = len(chunk)
                 if datalen < PAYLOAD_SIZE:
                     chunk = chunk + b'\x00' * (PAYLOAD_SIZE - datalen)
                 self._SEQ = (self._SEQ + 1) % MAX_VALUE
-                segment = self.make_packet(self._SEQ % MAX_VALUE, self._count % 65535, chunk, self._window,
+                segment = self.make_packet(self._SEQ % MAX_VALUE, 0, chunk, self._window,
                                            length=datalen)
-                self._count += 1
                 self._packet_timestamps.append(time.time())
                 self._lossy_layer.send_segment(segment)
-                self._sent_packet.append(segment)
-                #self._resend[self._SEQ % MAX_VALUE] = segment
-                print("PACKET seq {} & count {} ".format(self._SEQ % MAX_VALUE, self._count))
-
+                self._packet_sent[self._SEQ % MAX_VALUE] = segment
                 self._window_control -= 1
 
             except queue.Empty:
                 # No data was available for sending.
                 break
-            #self.check_timeout()
 
     def check_timeout(self):
         timeout = self.get_timeout()  # check for timeout
-        if timeout[0] != -1:  # timeout
-            print("TIMEOUT")
-            self.timeout(timeout)
+        if timeout and len(self._packet_sent) != 0:  # timeout
+            self.timeout()
             return True
         return False
 
-    def timeout(self, bounds):
+    def timeout(self):
         """
-        for every timeout first resend, then append new timestamp, then append packet to sent_packet,
-        then remove first entry in both
+        Resend all the segments stored in the dictionary and append new timers, pop old ones
         """
-        print("TIMEOUT PACKS:")
-        #sent_packet = self._resend.values()
-        # print("DIC###",sent_packet)
-        lower, upper = bounds
-        for i in range(lower, upper +1):
+        sent_packet = self._packet_sent.values()
+        for i in sent_packet:
             try:
-                self._lossy_layer.send_segment(self._sent_packet[0])
+                self._lossy_layer.send_segment(i)
                 self._packet_timestamps.append(time.time())
-                self._sent_packet.append(self._sent_packet[0])
-                self._sent_packet.pop(0)
                 self._packet_timestamps.pop(0)
             except IndexError:
-                print("INDEX ERROR TIMEOUT(). EXITING LOOP")
                 return
 
     def get_timeout(self):
-        i = 0
-        lower_bound = -1
-        upper_bound = -1
         current_time = time.time()
-        while i < len(self._packet_timestamps) and current_time - self._packet_timestamps[i] >= 1:  # timeout after 1 sec
-            lower_bound = 0
-            upper_bound = i
-            i += 1
-            current_time = time.time()
-        # print("bounds: \t" + str(lower_bound) + "\t" + str(upper_bound))
-        return (lower_bound, upper_bound)
+        try:
+            if current_time - self._packet_timestamps[0] >= 1:
+                return True
+            else:
+                return False
+        except IndexError:
+            pass
 
     def connect(self):
         """Perform the bTCP three-way handshake to establish a connection.
         """
-        retries = 3
-        #self._SEQ = getrandbits(16)
-        self._SEQ = 65530
+        self._SEQ = getrandbits(16)
         syn_segment = self.make_packet(self._SEQ, 0, NO_DATA, self._window, syn_flag=True)
         self._lossy_layer.send_segment(syn_segment)
-        self._sent_packet.append(syn_segment)
+        self._packet_sent[self._SEQ] = syn_segment
         self._packet_timestamps.append(time.time())
         self._state = BTCPStates.SYN_SENT
         self._flag = True
         while self._flag:  # Wait to rcv SYN&ACK
             if self.check_timeout():
-                retries -= 1
-            if retries == 0:
-                #close client?
+                self._retries += 1
+            if self._retries == MAX_RETRIES:
                 self._state = BTCPStates.CLOSED
+                self.shutdown()
+                self.close()
+                return
             time.sleep(0.1)  # 100ms
 
         ack_segment = self.make_packet(self._SEQ, self._ACK, NO_DATA, self._window, ack_flag=True)
         self._lossy_layer.send_segment(ack_segment)
-        #self._sent_packet.append(ack_segment)
-        #self._packet_timestamps.append(time.time())
-        self._last_ACK = (self._SEQ) % MAX_VALUE
+        self._last_ACK = self._SEQ % MAX_VALUE
         self._state = BTCPStates.ESTABLISHED
         return
 
@@ -374,7 +330,6 @@ class BTCPSocket:
         syn_ack = self.make_packet(self._SEQ, self._ACK, NO_DATA, self._window, syn_flag=True, ack_flag=True)
         self._lossy_layer.send_segment(syn_ack)
         self._state = BTCPStates.SYN_SENT
-        #loop here in state until ack in reply to synack
 
     def send(self, data):
         """Send data originating from the application in a reliable way to the
@@ -406,7 +361,7 @@ class BTCPSocket:
             # Wait until one segment becomes available in the buffer, or
             # timeout signalling disconnect.
 
-            data.extend(self._recvbuf.get(block=True, timeout=3))
+            data.extend(self._recvbuf.get(block=True, timeout=5))
             while True:
                 # Empty the rest of the buffer, until queue.Empty exception
                 # exits the loop. If that happens, data contains received
@@ -415,35 +370,38 @@ class BTCPSocket:
         except queue.Empty:
             pass  # (Not break: the exception itself has exited the loop)
         if self._state == BTCPStates.CLOSED:
-            self.close()
             return
         return bytes(data)
 
     def shutdown(self):
         """Perform the bTCP three-way finish to shutdown the connection.
         """
-        retries = 3
 
-        while not self._sendbuf.empty() or len(self._sent_packet) != 0:
+        while not self._sendbuf.empty() or len(self._packet_sent) != 0:
             sleep(0.1)
             continue
         fin_segment = self.make_packet(self._SEQ % MAX_VALUE, 0, NO_DATA, self._window, fin_flag=True)
-        self._lossy_layer.send_segment(fin_segment)
-        self._sent_packet.append(fin_segment)
-        self._packet_timestamps.append(time.time())
         self._state = BTCPStates.FIN_SENT
+
+        self._lossy_layer.send_segment(fin_segment)
+        self._packet_sent[self._SEQ % MAX_VALUE] = fin_segment
+        self._packet_timestamps.append(time.time())
         self._flag = True
+        print("Closing")
+
         while self._flag:  # Wait for FIN&ACK
-            print("Closing")
             if self.check_timeout():
-                retries -=1
-            if retries == 0:
+                self._retries += 1
+            if self._retries == MAX_RETRIES:
                 self._state = BTCPStates.CLOSED
+                self.close()
                 return
+
+        self._state = BTCPStates.CLOSED
 
         ack_segment = self.make_packet(self._SEQ % MAX_VALUE, self._ACK, NO_DATA, self._window, ack_flag=True)
         self._lossy_layer.send_segment(ack_segment)
-        self._state = BTCPStates.CLOSED
+        print("ACK SENT")
         return
 
     def close(self):
