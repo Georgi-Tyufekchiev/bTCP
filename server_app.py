@@ -1,4 +1,6 @@
 import argparse
+import filecmp
+
 from btcp.server_socket import BTCPServerSocket
 from btcp.btcp_socket import *
 
@@ -46,7 +48,7 @@ def btcp_file_transfer_server():
     parser = argparse.ArgumentParser()
     parser.add_argument("-w", "--window",
                         help="Define bTCP window size",
-                        type=int, default=200)
+                        type=int, default=150)
     parser.add_argument("-t", "--timeout",
                         help="Define bTCP timeout in milliseconds",
                         type=int, default=100)
@@ -64,6 +66,7 @@ def btcp_file_transfer_server():
     # client and just dumps all segment contents directly into a file. No
     # handshake is performed.
     s.accept()
+    from timeit import default_timer as timer
 
     # Actually open the output file. Warning: will overwrite existing files.
     with open(args.output, 'wb') as outfile:
@@ -72,7 +75,8 @@ def btcp_file_transfer_server():
         # expression operator instead:
         # while recvdata := s.recv():
         recvdata = s.recv()
-        while True:
+        start = timer()
+        while recvdata:
             outfile.write(recvdata)
             # Read new data from the socket.
             recvdata = s.recv()
@@ -82,7 +86,12 @@ def btcp_file_transfer_server():
         # output file.
 
     # Clean up any state
+    end = timer()
+
+    print("TIME", end-start)
+
     s.close()
+    print(filecmp.cmp("LessMB","output.file"))
 
 
 if __name__ == "__main__":

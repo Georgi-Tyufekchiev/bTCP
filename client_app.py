@@ -1,4 +1,5 @@
 import argparse
+import filecmp
 import time
 from btcp.client_socket import BTCPClientSocket
 from btcp.btcp_socket import *
@@ -14,6 +15,7 @@ reference. Python itself will run it fine, though.
 You can also use the file large_input.py as-is for file transfer.
 """
 from large_input import TEST_BYTES_128MIB
+from SOMB import random_bytes
 
 
 def btcp_file_transfer_client():
@@ -53,7 +55,7 @@ def btcp_file_transfer_client():
                         type=int, default=100)
     parser.add_argument("-i", "--input",
                         help="File to send",
-                        default="testFile.py")
+                        default="LessMB")
     args = parser.parse_args()
 
     # Create a bTCP client socket with the given window size and timeout value
@@ -96,7 +98,7 @@ def btcp_file_transfer_client():
 
     # Disconnect, since we're done reading the file and done sending.
     # Note that by default this doesn't do *anything*.
-    sleep(10)
+    print("##############################################")
     s.shutdown()
 
     # Clean up any state
